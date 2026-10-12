@@ -15,6 +15,9 @@ services:
       - db
     ports:
       - "8010:8010"
+    volumes:
+      - ./master.cfg:/var/lib/buildbot/master.cfg:ro
+      - ./worker_details.py:/var/lib/buildbot/worker_details.py:ro
   db:
     env_file:
       - db.env

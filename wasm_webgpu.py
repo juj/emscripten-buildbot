@@ -26,14 +26,18 @@ builders = [
 # Emscripten main branch, so unlike with sdk-main-64bit, LLVM does not get built from source.
 emscripten_sdk = 'tot'
 
+# The version of the Python that emsdk installs for its own use on Windows and macOS. Keep this
+# the same as the first version that emsdk.bat looks for.
+emsdk_python_version = '3.13.3'
+
 # The emsdk packages of the latest stable Firefox, and of the latest stable Chrome for Testing.
 emsdk_browsers = ['firefox-latest-64bit', 'chrome-stable-64bit']
 
-# The browsers that come with macOS: (name, the value to pass to test.py --browser). emrun splits
-# the path of an .app bundle at spaces, so the spaces in it need to be escaped with backslashes.
+# The browsers that come with macOS: (name, path of the .app bundle). A browser that is not
+# installed on the worker is skipped.
 mac_browsers = [
     ('Safari', '/Applications/Safari.app'),
-    ('Safari Technology Preview', '/Applications/Safari\\ Technology\\ Preview.app'),
+    ('Safari Technology Preview', '/Applications/Safari Technology Preview.app'),
 ]
 
 # (name, test.py args). Each of these is one full run of test.py in each browser, i.e. every test
@@ -45,11 +49,13 @@ test_variants = [
 #    ('sanitize', ['--sanitize']),
 ]
 
-# The whole suite is run in a browser only if this test passes in it first. test.py leaves the
-# browser running when a test fails or times out, so if a browser cannot run the tests at all on
-# a worker (e.g. it has no WebGPU support there), a run of the whole suite would spend hours in
-# test timeouts, and leave behind a browser for each test.
-smoke_test = 'navigator_gpu_available'
+# The whole suite is run in a browser only if these tests pass in it first. The first one ends in
+# main(). The second one ends in a callback that is called after main() has returned, like most
+# of the tests of the suite do. test.py leaves the browser running when a test fails or times
+# out, so if a browser cannot run the tests at all on a worker (e.g. it has no WebGPU support
+# there), a run of the whole suite would spend hours in test timeouts, and leave behind a browser
+# for each test.
+smoke_tests = ['navigator_gpu_available', 'navigator_gpu_request_adapter_async_simple']
 
 
 def describe_test(cmdline):
@@ -89,12 +95,13 @@ class TestPyLineObserver(util.LogLineObserver):
 class WasmWebGpuTestStep(steps.ShellCommand):
     """Runs test.py. It exits with return code zero also when tests fail, so the result of the step
     is read from what test.py printed. If passed_property is given, sets that build property to
-    tell whether all the tests passed."""
+    tell whether all the tests passed. skip_reason is shown if doStepIf skips the step."""
 
-    def __init__(self, label=None, passed_property=None, **kwargs):
+    def __init__(self, label=None, passed_property=None, skip_reason=None, **kwargs):
         super().__init__(**kwargs)
         self.label = label
         self.passed_property = passed_property
+        self.skip_reason = skip_reason
         self.observer = TestPyLineObserver()
         self.addLogObserver('stdio', self.observer)
         self.progressMetrics += ('tests',)
@@ -120,7 +127,7 @@ class WasmWebGpuTestStep(steps.ShellCommand):
     def getResultSummary(self):
         o = self.observer
         if self.results == SKIPPED:
-            return {'step': f'{self.label}: skipped, since the smoke test failed'}
+            return {'step': f'{self.label}: skipped, since {self.skip_reason}'}
         if not self.finished_all_tests():
             return {'step': f'{self.label}: test.py did not run the tests to the end', 'build': f'FATAL:{self.label}'}
         if o.num_passed == o.num_total and self.results == SUCCESS:
@@ -163,8 +170,14 @@ def create_build_factory(os, emsdk_branch):
 
     def add_kill_browsers_step():
         if win:
+            # On Windows also kill the emrun web servers of this build directory. When a test
+            # times out, test.py kills emrun.exe, but that is only a launcher: the Python process
+            # that it started keeps running, and keeps serving in the port that the next tests
+            # use. They would then all time out, since the test pages would talk to the old server.
             cmd = ('powershell -NoProfile -Command "$d = (Get-Location).Path; Get-Process | Where-Object '
-                   "{ $_.Path -like ($d + '\\firefox\\*') -or $_.Path -like ($d + '\\chrome\\*') } | Stop-Process -Force\"")
+                   "{ $_.Path -like ($d + '\\firefox\\*') -or $_.Path -like ($d + '\\chrome\\*') } | Stop-Process -Force; "
+                   "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -like ('*' + $d + '\\*emrun.py*') } "
+                   '| ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"')
         else:
             script = 'pkill -9 -f "$PWD/firefox/"; pkill -9 -f "$PWD/chrome/"; '
             if os == 'mac':
@@ -181,6 +194,17 @@ def create_build_factory(os, emsdk_branch):
     factory.addStep(steps.Git(name='git wasm_webgpu', repourl=wasm_webgpu_repo, branch=wasm_webgpu_branch,
                               workdir='build/wasm_webgpu', mode='incremental', haltOnFailure=True))
 
+    if win:
+        # emsdk.bat runs emsdk.py in the Python that emsdk has installed for itself. A new build
+        # directory does not have that Python yet, and emsdk.bat then uses the 'python' of PATH,
+        # which on the Windows worker is a dummy that does nothing. So install the Python of emsdk
+        # first, with the first python.exe of PATH that manages to do it.
+        emsdk_python = f'python\\{emsdk_python_version}_64bit\\python.exe'
+        cmd = (f'(for /f "delims=" %%p in (\'where python.exe\') do if not exist {emsdk_python} "%%p" emsdk.py install python-{emsdk_python_version}-64bit)'
+               f' & if not exist {emsdk_python} (echo No python.exe of PATH was able to install {emsdk_python} & exit /b 1)')
+        factory.addStep(steps.ShellCommand(name='install emsdk python', command=cmd, haltOnFailure=True,
+                                           hideStepIf=lambda results, s: results == SUCCESS))
+
     factory.addStep(steps.ShellCommand(name='emsdk install', command=[emsdk_cmd, 'install', emscripten_sdk] + emsdk_browsers,
                                        haltOnFailure=True, timeout=60*60))
     factory.addStep(steps.ShellCommand(name='emsdk activate', command=[emsdk_cmd, 'activate', emscripten_sdk], haltOnFailure=True))
@@ -192,26 +216,40 @@ def create_build_factory(os, emsdk_branch):
 
     add_kill_browsers_step()
 
-    # (name, the emsdk package to activate or None, the --browser arg on the command line of test.py)
-    browsers = [(b.replace('-64bit', ''), b, '"!EMTEST_BROWSER!"' if win else '"$EMTEST_BROWSER"') for b in emsdk_browsers]
+    # (name, the emsdk package to activate or None, the path of the .app bundle or None)
+    browsers = [(b.replace('-64bit', ''), b, None) for b in emsdk_browsers]
     if os == 'mac':
-        browsers += [(name, None, shlex.quote(path)) for name, path in mac_browsers]
+        browsers += [(name, None, app) for name, app in mac_browsers]
 
     i = 1
     num_test_runs = len(browsers) * len(test_variants)
-    for browser_name, emsdk_package, browser_arg in browsers:
+    for browser_name, emsdk_package, app in browsers:
         if emsdk_package:
             # Activating the browser makes emsdk_env set the path of its executable to EMTEST_BROWSER.
             factory.addStep(steps.ShellCommand(name=f'emsdk activate {emsdk_package}', command=[emsdk_cmd, 'activate', emsdk_package],
                                                haltOnFailure=True, hideStepIf=lambda results, s: results == SUCCESS))
+            browser_arg = '"!EMTEST_BROWSER!"' if win else '"$EMTEST_BROWSER"'
+            is_installed = True
+        else:
+            # Find out if the browser is installed on the worker. 'test' exits with 1 if it is not.
+            installed = f'{browser_name} is installed'
+            factory.addStep(steps.SetPropertyFromCommand(name=f'check for {browser_name}', command=['test', '-d', app],
+                                                         extract_fn=lambda rc, stdout, stderr, prop=installed: {prop: rc == 0},
+                                                         decodeRC={0: SUCCESS, 1: SUCCESS},
+                                                         hideStepIf=lambda results, s: results == SUCCESS))
+            # emrun splits the path of an .app bundle at spaces, so the spaces in it need to be escaped with backslashes.
+            browser_arg = shlex.quote(app.replace(' ', '\\ '))
+            is_installed = lambda step, prop=installed: bool(step.getProperty(prop))
 
         for variant_name, variant_args in test_variants:
             label = f'{browser_name}/{variant_name}'
             smoke_test_passed = f'{label} smoke test passed'
-            add_test_step(f'Smoke test {label}', f'{label} smoke test', browser_arg, variant_args + [smoke_test],
-                          passed_property=smoke_test_passed)
+            add_test_step(f'Smoke test {label}', f'{label} smoke test', browser_arg, variant_args + smoke_tests,
+                          passed_property=smoke_test_passed,
+                          doStepIf=is_installed, skip_reason=f'{browser_name} is not installed')
             add_test_step(f'Test {i}/{num_test_runs} {label}', label, browser_arg, variant_args,
-                          doStepIf=lambda step, prop=smoke_test_passed: bool(step.getProperty(prop)))
+                          doStepIf=lambda step, prop=smoke_test_passed: bool(step.getProperty(prop)),
+                          skip_reason='the smoke test did not pass')
             i += 1
 
         if emsdk_package:
